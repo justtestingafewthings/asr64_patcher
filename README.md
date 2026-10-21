@@ -1,19 +1,25 @@
 # asr64_patcher
-A tool to patch the signature checks of a 64-bit ASR binary.
+Patch ASR image-signature checks on ARM64 and ARMv7k watchOS 1-8 binaries.
 
 ## Build
 `make`
 
 ## Usage
-1. Extract binary from an iOS ramdisk (macOS only):
-    - `img4 -i <ramdisk> -o ramdisk.dmg`
-        - `img4` can be found [here](https://github.com/xerub/img4lib)
-    - `hdiutil attach ramdisk.dmg -mountpoint ramdisk`
-    - `cp ramdisk/usr/sbin/asr .`
-    - `hdiutil detach ramdisk`
 
-2. Run `asr64_patcher`:
-    - `asr64_patcher asr asr_patched`
+1. Extract binary from the ramdisk using
+   [img4](https://github.com/xerub/img4lib) and [hfsplus](https://github.com/justtestingafewthings/libdmg-hfsplus):
+
+   ```sh
+   img4 -i ramdisk.img4 -o ramdisk.raw
+   hfsplus ramdisk.raw extract usr/sbin/asr asr
+   ```
+
+2. Preview the patch, then write the output:
+
+   ```sh
+   ./asr64_patcher --dry-run asr
+   ./asr64_patcher asr asr_patched
+   ```
 
 3. Resign patched ASR binary
     - `ldid -e asr > ents.plist`

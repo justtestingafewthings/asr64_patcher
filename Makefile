@@ -1,4 +1,10 @@
-all:
-	gcc asr64_patcher.c -o asr64_patcher
+CC ?= cc
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+
+.PHONY: all clean
+all: asr64_patcher
+asr64_patcher: asr64_patcher.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) asr64_patcher.c $(LDFLAGS) -o $@
+
 clean:
-	rm asr64_patcher
+	rm -f asr64_patcher
