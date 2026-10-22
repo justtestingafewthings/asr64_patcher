@@ -1,10 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
-#include <stdint.h>
-#include <string.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -12,12 +12,22 @@ struct section {
   uint64_t address;
   size_t offset, length;
 };
+struct function {
+  size_t begin, end;
+  int thumb;
+};
 struct image {
   uint32_t cpu, subtype;
   struct section text, strings;
   uint64_t base;
   size_t functions, functions_length;
+  int have_functions;
+  struct function *bounds;
+  size_t nfunctions;
 };
+static uint16_t le16(const unsigned char *p) {
+  return (uint16_t)p[0] | (uint16_t)p[1] << 8;
+}
 static uint32_t le32(const unsigned char *p) {
   return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
          (uint32_t)p[3] << 24;
@@ -37,7 +47,6 @@ static int error(const char *message) {
   return -1;
 }
 
-/* Thin little-endian Mach-O only. */
 static int parse(const unsigned char *b, size_t n, struct image *im) {
   if (n < 28)
     return error("truncated Mach-O header");
@@ -50,8 +59,10 @@ static int parse(const unsigned char *b, size_t n, struct image *im) {
   im->cpu = le32(b + 4);
   im->subtype = le32(b + 8);
   if ((wide && (im->cpu != 0x100000c || (im->subtype & 0xffffff) > 2)) ||
-      (!wide && (im->cpu != 12 || im->subtype != 12)))
-    return error("unsupported architecture, expected ARM64 or ARMv7k");
+      (!wide && (im->cpu != 12 ||
+                 (im->subtype != 9 && im->subtype != 11 && im->subtype != 12))))
+    return error(
+        "unsupported architecture, expected ARM64, ARMv7, ARMv7s or ARMv7k");
   uint32_t commands = le32(b + 16), bytes = le32(b + 20);
   if (!range(head, bytes, n) || commands > bytes / 8)
     return error("invalid load-command bounds");
@@ -64,9 +75,10 @@ static int parse(const unsigned char *b, size_t n, struct image *im) {
     if (size < 8 || size % 4 || !range(p, size, end))
       return error("invalid load command size");
     if (cmd == 0x26) {
-      if (size != 16 || im->functions_length ||
+      if (size != 16 || im->have_functions ||
           !range(le32(b + p + 8), le32(b + p + 12), n))
         return error("invalid function starts");
+      im->have_functions = 1;
       im->functions = le32(b + p + 8);
       im->functions_length = le32(b + p + 12);
     }
@@ -125,6 +137,115 @@ static int parse(const unsigned char *b, size_t n, struct image *im) {
     return error("unaligned ARM64 text");
   return 0;
 }
+/* Old ARMv7 binaries lack LC_FUNCTION_STARTS. */
+static int thumb_prologue(const unsigned char *code, size_t p, size_t end) {
+  if (end - p < 4)
+    return 0;
+  unsigned push = le16(code + p), registers = push & 255, count = 0;
+  if ((push & 0xff80) != 0xb580)
+    return 0;
+  for (; registers; registers >>= 1)
+    count += registers & 1;
+  return le16(code + p + 2) == (0xaf00 | (count - 1));
+}
+static int legacy_function_starts(const unsigned char *b, struct image *im) {
+  if (im->cpu != 12 || im->subtype != 9 || im->text.address % 2 ||
+      im->text.offset % 2 || im->text.length % 2)
+    return error("missing function starts");
+  const unsigned char *code = b + im->text.offset;
+  size_t count = 0;
+  for (size_t p = 0; p < im->text.length; p += 2)
+    count += thumb_prologue(code, p, im->text.length);
+  if (!count || count > SIZE_MAX / sizeof(*im->bounds))
+    return error("missing Thumb function prologues");
+  im->bounds = calloc(count, sizeof(*im->bounds));
+  if (!im->bounds)
+    return error("out of memory");
+  for (size_t p = 0; p < im->text.length; p += 2) {
+    if (!thumb_prologue(code, p, im->text.length))
+      continue;
+    if (im->nfunctions)
+      im->bounds[im->nfunctions - 1].end = p;
+    im->bounds[im->nfunctions++] = (struct function){p, im->text.length, 1};
+  }
+  return 0;
+}
+static int function_starts(const unsigned char *b, struct image *im) {
+  if (!im->have_functions)
+    return legacy_function_starts(b, im);
+  if (!im->functions_length)
+    return error("missing function starts");
+  uint64_t address = im->base, delta = 0;
+  size_t capacity = 0;
+  unsigned shift = 0;
+  int terminated = 0;
+  for (size_t i = 0; i < im->functions_length; ++i) {
+    unsigned byte = b[im->functions + i];
+    if (terminated) {
+      if (byte)
+        return error("nonzero function-start padding");
+      continue;
+    }
+    if (shift >= 63 || (uint64_t)(byte & 127) > (UINT64_MAX >> shift))
+      return error("invalid function-start delta");
+    delta |= (uint64_t)(byte & 127) << shift;
+    if (byte & 128) {
+      shift += 7;
+      continue;
+    }
+    if (!delta) {
+      terminated = 1;
+      continue;
+    }
+    if (address > UINT64_MAX - delta)
+      return error("function-start overflow");
+    address += delta;
+    uint64_t pc = im->cpu == 12 ? address & ~UINT64_C(1) : address;
+    if (pc < im->text.address || pc - im->text.address >= im->text.length ||
+        pc % (im->cpu == 12 ? 2 : 4))
+      return error("invalid function boundary");
+    size_t begin = (size_t)(pc - im->text.address);
+    if (im->nfunctions) {
+      struct function *previous = &im->bounds[im->nfunctions - 1];
+      if (begin <= previous->begin)
+        return error("unordered function starts");
+      previous->end = begin;
+    }
+    if (im->nfunctions == capacity) {
+      size_t next = capacity ? capacity * 2 : 64;
+      if (next > im->functions_length)
+        next = im->functions_length;
+      if (next > SIZE_MAX / sizeof(*im->bounds))
+        return error("too many function starts");
+      struct function *bounds = realloc(im->bounds, next * sizeof(*bounds));
+      if (!bounds)
+        return error("out of memory");
+      im->bounds = bounds;
+      capacity = next;
+    }
+    im->bounds[im->nfunctions++] =
+        (struct function){begin, im->text.length, (address & 1) != 0};
+    shift = 0;
+    delta = 0;
+  }
+  if (!terminated || !im->nfunctions)
+    return error("missing or unterminated function starts");
+  return 0;
+}
+static const struct function *function_at(const struct image *im, size_t site) {
+  size_t lo = 0, hi = im->nfunctions;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    const struct function *f = &im->bounds[mid];
+    if (site < f->begin)
+      hi = mid;
+    else if (site >= f->end)
+      lo = mid + 1;
+    else
+      return f;
+  }
+  return NULL;
+}
 static int64_t sx(uint64_t x, unsigned bits) {
   return (int64_t)(x ^ (UINT64_C(1) << (bits - 1))) -
          (int64_t)(UINT64_C(1) << (bits - 1));
@@ -144,9 +265,6 @@ static int literal(const unsigned char *b, const struct section *s,
       ++found;
     }
   return found == 1 ? 0 : error("missing or ambiguous signature diagnostic");
-}
-static uint16_t le16(const unsigned char *p) {
-  return (uint16_t)p[0] | (uint16_t)p[1] << 8;
 }
 static size_t thumb_size(const unsigned char *code, size_t p) {
   return (le16(code + p) >> 11) >= 29 ? 4 : 2;
@@ -252,6 +370,17 @@ struct thumb_patch {
   uint32_t replacement;
   int patched;
 };
+static int thumb_jump(size_t site, size_t target, uint32_t *replacement) {
+  int64_t delta = (int64_t)target - (int64_t)site - 4;
+  if (delta % 2 || delta < -(INT64_C(1) << 24) || delta >= (INT64_C(1) << 24))
+    return 0;
+  uint32_t d = (uint32_t)delta, s = (d >> 24) & 1;
+  *replacement = 0xf000u | (s << 10) | ((d >> 12) & 0x3ff) |
+                 ((0x9000u | ((1 ^ ((d >> 23) & 1) ^ s) << 13) |
+                   ((1 ^ ((d >> 22) & 1) ^ s) << 11) | ((d >> 1) & 0x7ff))
+                  << 16);
+  return 1;
+}
 static int watch_candidate(const unsigned char *code, size_t begin, size_t end,
                            unsigned char *boundary, size_t p, size_t fail,
                            size_t pass, struct thumb_patch *patch) {
@@ -343,15 +472,8 @@ static int watch_candidate(const unsigned char *code, size_t begin, size_t end,
       replacement =
           reload | ((0xe000u | ((uint32_t)(delta / 2) & 0x7ff)) << 16);
     } else {
-      int64_t delta = (int64_t)success - (int64_t)site - 4;
-      if (delta % 2 || delta < -(INT64_C(1) << 24) ||
-          delta >= (INT64_C(1) << 24))
+      if (!thumb_jump(site, success, &replacement))
         continue;
-      uint32_t d = (uint32_t)delta, s = (d >> 24) & 1;
-      replacement = 0xf000u | (s << 10) | ((d >> 12) & 0x3ff) |
-                    ((0x9000u | ((1 ^ ((d >> 23) & 1) ^ s) << 13) |
-                      ((1 ^ ((d >> 22) & 1) ^ s) << 11) | ((d >> 1) & 0x7ff))
-                     << 16);
     }
     uint32_t current = le32(code + site);
     if (current != original && current != replacement)
@@ -363,21 +485,15 @@ static int watch_candidate(const unsigned char *code, size_t begin, size_t end,
   }
   return 0;
 }
-static int watch_function(const unsigned char *code, const struct section *text,
-                          size_t begin, size_t end, uint64_t failed,
-                          uint64_t passed, size_t *failure_function,
-                          struct thumb_patch *patch) {
-  unsigned char *boundary = calloc(end - begin, 1);
-  if (!boundary)
-    return error("out of memory");
-  size_t fail = 0, pass = 0, nf = 0, np = 0;
+static int thumb_boundaries(const unsigned char *code, size_t begin, size_t end,
+                            unsigned char *boundary) {
   unsigned it = 0;
   for (size_t p = begin; p < end;) {
-    size_t length = thumb_size(code, p);
-    if (end - p < length) {
-      free(boundary);
+    if (end - p < 2)
       return 0;
-    }
+    size_t length = thumb_size(code, p);
+    if (end - p < length)
+      return 0;
     boundary[p - begin] = 1 | (it ? 4 : 0);
     if (it)
       --it;
@@ -389,6 +505,23 @@ static int watch_function(const unsigned char *code, const struct section *text,
         mask >>= 1;
       }
     }
+    p += length;
+  }
+  return 1;
+}
+static int watch_function(const unsigned char *code, const struct section *text,
+                          size_t begin, size_t end, uint64_t failed,
+                          uint64_t passed, size_t *failure_function,
+                          struct thumb_patch *patch) {
+  unsigned char *boundary = calloc(end - begin, 1);
+  if (!boundary)
+    return error("out of memory");
+  size_t fail = 0, pass = 0, nf = 0, np = 0;
+  if (!thumb_boundaries(code, begin, end, boundary)) {
+    free(boundary);
+    return 0;
+  }
+  for (size_t p = begin; p < end; p += thumb_size(code, p)) {
     if (thumb_string(code, p, end, text->address, failed)) {
       fail = p;
       ++nf;
@@ -397,7 +530,6 @@ static int watch_function(const unsigned char *code, const struct section *text,
       pass = p;
       ++np;
     }
-    p += length;
   }
   if (!passed) {
     if (nf)
@@ -443,51 +575,13 @@ static int watch(unsigned char *b, const struct image *im) {
   int count = 0;
   struct thumb_patch patch = {0};
   for (int round = 0; round < 2; ++round) {
-    uint64_t address = im->base, delta = 0;
-    size_t begin = 0;
-    unsigned shift = 0;
-    int have_begin = 0, terminated = 0;
     count = 0;
-    for (size_t i = 0; i < im->functions_length; ++i) {
-      unsigned byte = b[im->functions + i];
-      if (shift >= 63 || (uint64_t)(byte & 127) > (UINT64_MAX >> shift))
-        return error("invalid function-start delta");
-      delta |= (uint64_t)(byte & 127) << shift;
-      if (byte & 128) {
-        shift += 7;
+    for (size_t i = 0; i < im->nfunctions; ++i) {
+      const struct function *f = &im->bounds[i];
+      if (!f->thumb)
         continue;
-      }
-      if (!delta) {
-        terminated = 1;
-        break;
-      }
-      if (address > UINT64_MAX - delta)
-        return error("function-start overflow");
-      address += delta;
-      uint64_t pc = address & ~UINT64_C(1);
-      if (pc < im->text.address || pc - im->text.address >= im->text.length ||
-          (have_begin && pc - im->text.address <= begin))
-        return error("invalid function boundary");
-      size_t end = (size_t)(pc - im->text.address);
-      if (have_begin) {
-        int found =
-            watch_function(code, &im->text, begin, end, failed,
-                           round ? passed : 0, &failure_function, &patch);
-        if (found < 0)
-          return -1;
-        count += found;
-      }
-      begin = end;
-      have_begin = (address & 1) != 0;
-      shift = 0;
-      delta = 0;
-    }
-    if (!terminated)
-      return error("unterminated function starts");
-    if (have_begin) {
-      int found =
-          watch_function(code, &im->text, begin, im->text.length, failed,
-                         round ? passed : 0, &failure_function, &patch);
+      int found = watch_function(code, &im->text, f->begin, f->end, failed,
+                                 round ? passed : 0, &failure_function, &patch);
       if (found < 0)
         return -1;
       count += found;
@@ -503,7 +597,389 @@ static int watch(unsigned char *b, const struct image *im) {
   return 0;
 }
 
-/* Legacy xref64 address tracking in VM space. */
+struct thumb_diagnostic {
+  size_t site, call, width;
+  uint32_t original;
+  int64_t logger;
+};
+static int thumb_boundary(const unsigned char *boundary,
+                          const struct function *f, size_t p) {
+  return p >= f->begin && p < f->end && boundary[p - f->begin] == 1;
+}
+static int thumb_previous(const unsigned char *code,
+                          const unsigned char *boundary,
+                          const struct function *f, size_t p,
+                          size_t *previous) {
+  for (size_t length = 2; length <= 4; length += 2) {
+    if (p - f->begin >= length && (boundary[p - length - f->begin] & 1) &&
+        thumb_size(code, p - length) == length) {
+      *previous = p - length;
+      return 1;
+    }
+  }
+  return 0;
+}
+static int64_t thumb_call_target(const unsigned char *code, uint64_t vm,
+                                 size_t call) {
+  unsigned first = le16(code + call), second = le16(code + call + 2),
+           sign = (first >> 10) & 1;
+  uint64_t pc = vm + call + 4;
+  if (!(second & 0x1000))
+    pc &= ~UINT64_C(3); /* BLX uses a word-aligned PC. */
+  int64_t delta = sx((sign << 24) | ((1 ^ ((second >> 13) & 1) ^ sign) << 23) |
+                         ((1 ^ ((second >> 11) & 1) ^ sign) << 22) |
+                         ((first & 0x3ff) << 12) | ((second & 0x7ff) << 1),
+                     25);
+  return (int64_t)(pc - vm) + delta;
+}
+static int thumb_diagnostic(const unsigned char *code, uint64_t vm,
+                            const struct function *f,
+                            const unsigned char *boundary, size_t p,
+                            uint64_t string, int failure,
+                            struct thumb_diagnostic *diagnostic) {
+  if (f->end - p < 14 || !thumb_boundary(boundary, f, p))
+    return 0;
+  size_t q = p + 4;
+  unsigned op = le16(code + q);
+  int unrelated = ((op >> 8) & 7) != 0;
+  int status = failure && unrelated && (op & 0xf8ff) == 0x2050;
+  if (status || (!failure && unrelated && (op & 0xf8ff) == 0x2001))
+    q += 2;
+  if (f->end - q < 10 || !thumb_boundary(boundary, f, q) ||
+      (le16(code + q) & 0xfbf0) != 0xf2c0 || (le16(code + q + 2) & 0x8f00) ||
+      !thumb_boundary(boundary, f, q + 4) || le16(code + q + 4) != 0x4478 ||
+      !thumb_boundary(boundary, f, q + 6) || !thumb_call(code, q + 6, f->end))
+    return 0;
+  uint32_t value = (uint32_t)(string - (vm + q + 8));
+  if (thumb_imm16(code + q) != value >> 16)
+    return 0;
+  unsigned low = value & 65535;
+  uint32_t original = 0xf240u | ((low >> 12) & 15) | (((low >> 11) & 1) << 10) |
+                      (((((low >> 8) & 7) << 12) | (low & 255)) << 16);
+  int64_t target;
+  int condition;
+  if (le32(code + p) != original &&
+      (!failure || !thumb_branch(code, p, f->end, &target, &condition) ||
+       condition != -1 || thumb_size(code, p) != 4))
+    return 0;
+  size_t call = q + 6;
+  if (failure && !status) {
+    if (f->end - call < 6)
+      return 0;
+    unsigned first = le16(code + call + 4);
+    int narrow = (first & 0xf8ff) == 0x2050;
+    int wide = f->end - call >= 8 && first == 0xf04f &&
+               (le16(code + call + 6) & 0xf0ff) == 0x0050;
+    if (!narrow && !wide)
+      return 0;
+  }
+  *diagnostic = (struct thumb_diagnostic){p, call, 4, original,
+                                          thumb_call_target(code, vm, call)};
+  return 1;
+}
+static int thumb_literal_diagnostic(const unsigned char *code, uint64_t vm,
+                                    const struct function *f,
+                                    const unsigned char *boundary, size_t p,
+                                    uint64_t string, int failure,
+                                    struct thumb_diagnostic *diagnostic) {
+  if (f->end - p < 8 || !thumb_boundary(boundary, f, p))
+    return 0;
+  unsigned op = le16(code + p);
+  size_t width = thumb_size(code, p);
+  int patched = 0, condition;
+  int64_t target;
+  if ((op & 0xff00) != 0x4800 &&
+      !(op == 0xf8df && !(le16(code + p + 2) & 0xf000))) {
+    if (!failure || !thumb_branch(code, p, f->end, &target, &condition) ||
+        condition != -1)
+      return 0;
+    patched = 1;
+  }
+  size_t call = p + width;
+  int pic = le16(code + call) == 0x4478;
+  if (pic)
+    call += 2;
+  if (!thumb_boundary(boundary, f, call) || !thumb_call(code, call, f->end))
+    return 0;
+  if (failure &&
+      (f->end - call < 6 || (le16(code + call + 4) & 0xf8ff) != 0x2050))
+    return 0;
+  uint32_t value =
+      pic ? (uint32_t)(string - (vm + p + width + 4)) : (uint32_t)string;
+  uint64_t base = (vm + p + 4) & ~UINT64_C(3);
+  size_t matches = 0;
+  uint32_t original = 0;
+  unsigned limit = width == 2 ? 1020 : 4095;
+  for (unsigned imm = 0; imm <= limit; imm += 4) {
+    uint64_t pool = base + imm;
+    if (pool < vm + f->begin || pool > vm + f->end || vm + f->end - pool < 4 ||
+        le32(code + (size_t)(pool - vm)) != value)
+      continue;
+    uint32_t load = width == 2
+                        ? (le32(code + p) & 0xffff0000u) | 0x4800u | (imm / 4)
+                        : 0xf8dfu | (imm << 16);
+    if (!patched && le32(code + p) != load)
+      continue;
+    original = load;
+    ++matches;
+  }
+  if (matches != 1)
+    return 0;
+  *diagnostic = (struct thumb_diagnostic){p, call, width, original,
+                                          thumb_call_target(code, vm, call)};
+  return 1;
+}
+static int thumb_literal_success(const unsigned char *code, uint64_t vm,
+                                 const struct function *f,
+                                 const unsigned char *boundary,
+                                 const struct thumb_diagnostic *passed,
+                                 const struct thumb_diagnostic *failed,
+                                 size_t *target) {
+  size_t after = passed->call + 4;
+  int64_t cleanup;
+  int condition;
+  if (after >= f->end || !thumb_boundary(boundary, f, after) ||
+      !thumb_branch(code, after, f->end, &cleanup, &condition) ||
+      condition != -1 || cleanup <= (int64_t)failed->call + 6 ||
+      cleanup >= (int64_t)f->end ||
+      !thumb_boundary(boundary, f, (size_t)cleanup))
+    return 0;
+  size_t begin = passed->site - f->begin > 16 ? passed->site - 16 : f->begin;
+  size_t count = 0;
+  for (size_t p = begin; p < passed->site; p += 2) {
+    if (!thumb_boundary(boundary, f, p) || (le16(code + p) & 0xf800) != 0x4800)
+      continue;
+    unsigned reg = (le16(code + p) >> 8) & 7;
+    uint64_t pool = ((vm + p + 4) & ~UINT64_C(3)) + (le16(code + p) & 255) * 4;
+    if (pool < vm + f->begin || pool > vm + f->end || vm + f->end - pool < 4)
+      continue;
+    size_t previous;
+    int64_t destination;
+    if (!thumb_previous(code, boundary, f, p, &previous) ||
+        !thumb_boundary(boundary, f, previous) ||
+        !thumb_branch(code, previous, f->end, &destination, &condition) ||
+        condition != -1 || destination != (int64_t)failed->site)
+      continue;
+    size_t q = p + 2;
+    int pic = le16(code + q) == (0x4478 | reg);
+    if (pic != (passed->call - passed->site - passed->width == 2))
+      continue;
+    if (pic)
+      q += 2;
+    if (q >= passed->site || passed->site - q < 6 ||
+        le16(code + q) != (0x6800 | (reg << 3) | reg) ||
+        le16(code + q + 2) != (0x6800 | (reg << 3) | reg))
+      continue;
+    q += 4;
+    int compare = le16(code + q) == (0x2800 | (reg << 8));
+    if (compare)
+      q += 2;
+    if (q >= passed->site || !thumb_boundary(boundary, f, q) ||
+        !thumb_branch(code, q, f->end, &destination, &condition) ||
+        destination != cleanup || q + thumb_size(code, q) != passed->site ||
+        (compare ? condition != 0
+                 : (condition != 16 || (le16(code + q) & 7) != reg)))
+      continue;
+    *target = p;
+    ++count;
+  }
+  return count == 1;
+}
+static int thumb_load(const unsigned char *code, size_t p, unsigned *rd,
+                      unsigned *rn, unsigned *immediate) {
+  unsigned first = le16(code + p);
+  if ((first & 0xf800) == 0x9800) {
+    *rd = (first >> 8) & 7;
+    *rn = 13;
+    *immediate = (first & 255) * 4;
+  } else if ((first & 0xf800) == 0x6800) {
+    *rd = first & 7;
+    *rn = (first >> 3) & 7;
+    *immediate = ((first >> 6) & 31) * 4;
+  } else if ((first & 0xfff0) == 0xf8d0) {
+    *rn = first & 15;
+    *rd = le16(code + p + 2) >> 12;
+    *immediate = le16(code + p + 2) & 4095;
+  } else {
+    return 0;
+  }
+  return *rd < 13 && (*rn == 13 || (*rn < 13 && !*immediate));
+}
+/* Preserve success-path reloads and flags. */
+static int thumb_success(const unsigned char *code, const struct function *f,
+                         const unsigned char *boundary,
+                         const struct thumb_diagnostic *passed,
+                         size_t *target) {
+  size_t guard = 0, count = 0;
+  unsigned reg = 0;
+  size_t begin = passed->site - f->begin > 130 ? passed->site - 130 : f->begin;
+  for (size_t p = begin; p < passed->site; p += 2) {
+    if (!thumb_boundary(boundary, f, p) || (le16(code + p) & 0xf500) != 0xb100)
+      continue;
+    int64_t destination;
+    int condition;
+    if (!thumb_branch(code, p, f->end, &destination, &condition))
+      continue;
+    if (condition == 16 && p + 2 == passed->site &&
+        destination == (int64_t)passed->call + 4) {
+      guard = p;
+    } else if (condition == 17 && destination == (int64_t)passed->site) {
+      size_t q = p + 2;
+      unsigned rd, rn, imm;
+      while (q < passed->site && thumb_boundary(boundary, f, q) &&
+             thumb_load(code, q, &rd, &rn, &imm) && rn == 13)
+        q += thumb_size(code, q);
+      if (q >= passed->site || !thumb_boundary(boundary, f, q) ||
+          !thumb_branch(code, q, f->end, &destination, &condition) ||
+          condition != -1 || q + thumb_size(code, q) != passed->site ||
+          destination < (int64_t)f->begin || destination >= (int64_t)f->end ||
+          !thumb_boundary(boundary, f, (size_t)destination) ||
+          (destination >= (int64_t)passed->site &&
+           destination <= (int64_t)passed->call))
+        continue;
+      guard = p;
+    } else {
+      continue;
+    }
+    reg = le16(code + p) & 7;
+    ++count;
+  }
+  if (count != 1)
+    return 0;
+  size_t start = guard, previous = 0;
+  unsigned instructions = 0;
+  while (thumb_previous(code, boundary, f, start, &previous)) {
+    unsigned rd, rn, imm, op = le16(code + previous);
+    if (!thumb_boundary(boundary, f, previous) ||
+        (!thumb_load(code, previous, &rd, &rn, &imm) &&
+         (op & 0xf8ff) != 0x2001))
+      break;
+    if (++instructions > 6 || guard - previous > 24)
+      return 0;
+    start = previous;
+  }
+  unsigned rd, rn, imm;
+  if (!instructions || !thumb_load(code, start, &rd, &rn, &imm) || rn != 13 ||
+      !thumb_previous(code, boundary, f, start, &previous))
+    return 0;
+  int64_t branch;
+  int condition;
+  if (!thumb_call(code, previous, f->end) &&
+      !thumb_branch(code, previous, f->end, &branch, &condition))
+    return 0;
+  unsigned pointers = 0;
+  for (size_t p = start; p < guard; p += thumb_size(code, p)) {
+    if (thumb_load(code, p, &rd, &rn, &imm)) {
+      if (rn == 13) {
+        pointers |= 1u << rd;
+      } else {
+        if (!(pointers & (1u << rn)))
+          return 0;
+        pointers &= ~(1u << rd);
+      }
+    } else {
+      rd = (le16(code + p) >> 8) & 7;
+      pointers &= ~(1u << rd);
+    }
+  }
+  if (!thumb_previous(code, boundary, f, guard, &previous) ||
+      !thumb_load(code, previous, &rd, &rn, &imm) || rn == 13 || rd != reg)
+    return 0;
+  *target = start;
+  return 1;
+}
+static size_t legacy_body_end(const unsigned char *code,
+                              const struct function *f) {
+  if (f->end - f->begin < 20 || le32(code + f->begin) != 0xaf03b5f0u ||
+      le32(code + f->begin + 4) != 0x0d00e92du ||
+      (le16(code + f->begin + 8) & 0xff80) != 0xb080)
+    return 0;
+  for (size_t p = f->begin; f->end - p >= 10; p += thumb_size(code, p))
+    if (le32(code + p) == 0x0d18f1a7u && le32(code + p + 4) == 0x0d00e8bdu &&
+        le16(code + p + 8) == 0xbdf0)
+      return p + 10;
+  return 0;
+}
+static int armv7(unsigned char *b, const struct image *im) {
+  uint64_t failed = 0, passed = 0;
+  if (literal(b, &im->strings, "Image failed signature verification",
+              &failed) ||
+      literal(b, &im->strings, "Image passed signature verification", &passed))
+    return -1;
+  if (im->text.address % 2 || im->text.offset % 2 || im->text.length % 2)
+    return error("unaligned Thumb text");
+  const unsigned char *code = b + im->text.offset;
+  struct thumb_diagnostic failure = {0}, success = {0};
+  const struct function *ff = NULL, *sf = NULL;
+  size_t nf = 0, np = 0;
+  int (*diagnostic)(const unsigned char *, uint64_t, const struct function *,
+                    const unsigned char *, size_t, uint64_t, int,
+                    struct thumb_diagnostic *) =
+      im->have_functions ? thumb_diagnostic : thumb_literal_diagnostic;
+  for (size_t i = 0; i < im->nfunctions; ++i) {
+    const struct function *f = &im->bounds[i];
+    if (!f->thumb)
+      continue;
+    size_t end = im->have_functions ? f->end : legacy_body_end(code, f);
+    if (!end)
+      continue;
+    unsigned char *boundary = calloc(f->end - f->begin, 1);
+    if (!boundary)
+      return error("out of memory");
+    if (thumb_boundaries(code, f->begin, end, boundary)) {
+      for (size_t p = f->begin; p < end; p += thumb_size(code, p)) {
+        if (diagnostic(code, im->text.address, f, boundary, p, failed, 1,
+                       &failure)) {
+          ff = f;
+          ++nf;
+        }
+        if (diagnostic(code, im->text.address, f, boundary, p, passed, 0,
+                       &success)) {
+          sf = f;
+          ++np;
+        }
+      }
+    }
+    free(boundary);
+  }
+  if (nf != 1 || np != 1 || ff != sf || failure.logger != success.logger)
+    return error("unrecognized or ambiguous Thumb signature diagnostics");
+  unsigned char *boundary = calloc(sf->end - sf->begin, 1);
+  if (!boundary)
+    return error("out of memory");
+  size_t target = 0;
+  uint32_t replacement = 0;
+  size_t end = im->have_functions ? sf->end : legacy_body_end(code, sf);
+  int recognized =
+      end && thumb_boundaries(code, sf->begin, end, boundary) &&
+      (im->have_functions
+           ? thumb_success(code, sf, boundary, &success, &target)
+           : thumb_literal_success(code, im->text.address, sf, boundary,
+                                   &success, &failure, &target));
+  if (recognized && failure.width == 2) {
+    int64_t delta = (int64_t)target - (int64_t)failure.site - 4;
+    recognized = !(delta % 2) && delta >= -2048 && delta <= 2046;
+    replacement = (failure.original & 0xffff0000u) | 0xe000u |
+                  ((uint32_t)(delta / 2) & 0x7ff);
+  } else if (recognized) {
+    recognized = thumb_jump(failure.site, target, &replacement);
+  }
+  free(boundary);
+  if (!recognized)
+    return error("unrecognized Thumb success/cleanup path");
+  uint32_t original = le32(code + failure.site);
+  if (original != failure.original && original != replacement)
+    return error("unrecognized existing Thumb patch");
+  printf("ARMv7%s%s\n  file 0x%zx: %08" PRIx32 " -> %08" PRIx32
+         " (target VM 0x%" PRIx64 ")\n",
+         im->subtype == 11 ? "s" : "",
+         original == replacement ? " (already patched)" : "",
+         im->text.offset + failure.site, original, replacement,
+         im->text.address + target);
+  put32(b + im->text.offset + failure.site, replacement);
+  return 0;
+}
+
 static void arm64_refs(const unsigned char *b, const struct section *s,
                        uint64_t failed, uint64_t passed, size_t *fail,
                        size_t *pass, size_t *nf, size_t *np) {
@@ -574,6 +1050,44 @@ static void arm64_refs(const unsigned char *b, const struct section *s,
       valid[rd] = 0;
   }
 }
+static int64_t arm64_target(size_t p, uint32_t op) {
+  return (int64_t)p + sx(op & 0x3ffffff, 26) * 4;
+}
+static int arm64_log(const unsigned char *code, size_t p, size_t end,
+                     int patched, uint64_t string, int64_t *logger) {
+  if (p > end || end - p < 12)
+    return 0;
+  uint32_t first = le32(code + p), second = le32(code + p + 4),
+           call = le32(code + p + 8);
+  int adr = (first & 0x9f00001fu) == 0x10000000u,
+      adrp = (first & 0x9f00001fu) == 0x90000000u;
+  if (patched) {
+    if ((first & 0xfc000000u) != 0x14000000u)
+      return 0;
+    adr = second == 0xd503201fu;
+    adrp = (second & 0xffc003ffu) == 0x91000000u &&
+           ((second >> 10) & 4095) == (string & 4095);
+  }
+  if ((!adr || second != 0xd503201fu) &&
+      (!adrp || (second & 0xffc003ffu) != 0x91000000u))
+    return 0;
+  if ((call & 0xfc000000u) != 0x94000000u)
+    return 0;
+  *logger = arm64_target(p + 8, call);
+  return 1;
+}
+static int arm64_error_status(const unsigned char *code, size_t p, size_t end) {
+  if (p > end || end - p < 4)
+    return 0;
+  /* Some builds set the stream-open flag first. */
+  uint32_t first = le32(code + p);
+  if ((first & 0xffffffe0u) == 0x52800020u) {
+    p += 4;
+    if (end - p < 4 || (first & 31) == (le32(code + p) & 31))
+      return 0;
+  }
+  return (le32(code + p) & 0xffffffe0u) == 0x52800a00u;
+}
 static int arm64(unsigned char *b, const struct image *im) {
   uint64_t failed = 0, passed = 0;
   if (literal(b, &im->strings, "Image failed signature verification",
@@ -581,35 +1095,79 @@ static int arm64(unsigned char *b, const struct image *im) {
       literal(b, &im->strings, "Image passed signature verification", &passed))
     return -1;
   const struct section *s = &im->text;
-  size_t fail = 0, pass = 0, nf = 0, np = 0;
+  const unsigned char *code = b + s->offset;
+  size_t fail = 0, pass = 0, nf = 0, np = 0, site = 0, count = 0;
   arm64_refs(b, s, failed, passed, &fail, &pass, &nf, &np);
   if (np != 1 || nf > 1)
     return error("unrecognized or ambiguous ARM64 signature references");
-  int already = 0;
-  if (nf == 0) {
-    for (size_t off = 0; off + 4 <= s->length; off += 4) {
-      uint32_t a = le32(b + s->offset + off);
-      if ((a & 0xfc000000u) != 0x14000000u)
-        continue;
-      uint64_t target = s->address + off + sx(a & 0x3ffffff, 26) * 4;
-      if (target != s->address + pass)
-        continue;
-      fail = off;
-      ++nf;
+  const struct function *success = function_at(im, pass);
+  int64_t logger = 0, failure_logger = 0;
+  if (!success || !arm64_log(code, pass, success->end, 0, passed, &logger))
+    return error("unrecognized ARM64 success diagnostic");
+  int already = 0, helper = 0;
+  if (nf == 1) {
+    const struct function *failure = function_at(im, fail);
+    if (!failure ||
+        !arm64_log(code, fail, failure->end, 0, failed, &failure_logger) ||
+        failure_logger != logger)
+      return error("unrecognized ARM64 failure diagnostic");
+    if (failure == success) {
+      if (!arm64_error_status(code, fail + 12, failure->end))
+        return error("unrecognized ARM64 signature error status");
+      site = fail;
+      count = 1;
+    } else {
+      /* Patch the caller; the helper has its own stack frame. */
+      helper = 1;
+      if (fail - failure->begin > 32)
+        return error("unrecognized ARM64 failure helper");
+      for (size_t p = 0; p + 4 <= s->length; p += 4) {
+        uint32_t op = le32(code + p);
+        int original = (op & 0xfc000000u) == 0x94000000u &&
+                       arm64_target(p, op) == (int64_t)failure->begin;
+        int patched = (op & 0xfc000000u) == 0x14000000u &&
+                      arm64_target(p, op) == (int64_t)pass &&
+                      arm64_error_status(code, p + 4, success->end);
+        if (!original && !patched)
+          continue;
+        if (function_at(im, p) != success ||
+            !arm64_error_status(code, p + 4, success->end))
+          return error("unrecognized ARM64 failure-helper caller");
+        site = p;
+        already = patched;
+        ++count;
+      }
     }
-    already = 1;
+  } else {
+    for (size_t p = 0; p + 4 <= s->length; p += 4) {
+      uint32_t op = le32(code + p);
+      if ((op & 0xfc000000u) != 0x14000000u ||
+          arm64_target(p, op) != (int64_t)pass)
+        continue;
+      if (function_at(im, p) != success)
+        return error("unsafe existing ARM64 patch crosses function boundaries; "
+                     "use original ASR");
+      if (!arm64_log(code, p, success->end, 1, failed, &failure_logger) ||
+          failure_logger != logger ||
+          !arm64_error_status(code, p + 12, success->end))
+        continue;
+      site = p;
+      already = 1;
+      ++count;
+    }
   }
-  if (nf != 1 || fail == pass)
-    return error("unrecognized ARM64 signature references");
-  int64_t delta = (int64_t)pass - (int64_t)fail;
+  if (count != 1 || site == pass)
+    return error("unrecognized or ambiguous ARM64 signature verification");
+  int64_t delta = (int64_t)pass - (int64_t)site;
   if (delta % 4 || delta < -(INT64_C(1) << 27) || delta >= (INT64_C(1) << 27))
     return error("ARM64 branch out of range");
   uint32_t branch = 0x14000000u | ((uint32_t)(delta / 4) & 0x3ffffff);
-  printf("ARM64 legacy pattern%s\n  file 0x%zx: %08" PRIx32 " -> %08" PRIx32
+  printf("ARM64 %s%s\n  file 0x%zx: %08" PRIx32 " -> %08" PRIx32
          " (target VM 0x%" PRIx64 ")\n",
-         already ? " (already patched)" : "", s->offset + fail,
-         le32(b + s->offset + fail), branch, s->address + pass);
-  put32(b + s->offset + fail, branch);
+         helper ? "failure helper" : "inline",
+         already ? " (already patched)" : "", s->offset + site,
+         le32(code + site), branch, s->address + pass);
+  put32(b + s->offset + site, branch);
   return 0;
 }
 static int write_atomic(const char *path, const unsigned char *b, size_t n,
@@ -707,11 +1265,16 @@ int main(int argc, char **argv) {
   struct image im = {0};
   int result = parse(b, n, &im);
   if (!result)
-    result = im.cpu == 12 ? watch(b, &im) : arm64(b, &im);
+    result = function_starts(b, &im);
+  if (!result)
+    result = im.cpu != 12       ? arm64(b, &im)
+             : im.subtype == 12 ? watch(b, &im)
+                                : armv7(b, &im);
   if (!result && !dry)
     result = write_atomic(argv[2], b, n, st.st_mode);
   if (!result)
     puts(dry ? "Dry run: no output written." : "Patched ASR written.");
+  free(im.bounds);
   free(b);
   return result ? 1 : 0;
 }

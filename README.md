@@ -1,5 +1,5 @@
 # asr64_patcher
-Patch ASR image-signature checks on ARM64 and ARMv7k watchOS 1-8 binaries.
+Patch ASR image-signature checks on iOS 5-26, tvOS 4-26, and watchOS 1-8 binaries.
 
 ## Build
 `make`
